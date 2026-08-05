@@ -57,7 +57,7 @@ with col1:
     st.plotly_chart(fig_rmse, use_container_width=True)
 
 with col2:
-    st.markdown(### FSS 門檻分析)
+    st.markdown("### FSS 門檻分析")
     # 動態計算當前參數下的 FSS 數值
     fss_results = {}
     for exp in exp_selected:
