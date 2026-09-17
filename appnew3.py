@@ -1,0 +1,429 @@
+import os
+import sqlite3
+import numpy as np
+import pandas as pd
+import xarray as xr
+import json
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+from matplotlib.colors import LinearSegmentedColormap, BoundaryNorm
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+# ==========================================
+# 0. 設定 Matplotlib 中文字型 (無需 sudo 權限)
+# ==========================================
+# 請確認 font.ttf (例如文泉驛微米黑或思源黑體) 放在與 app.py 同一個資料夾
+FONT_PATH = "font.ttf"  
+
+if os.path.exists(FONT_PATH):
+    my_font = fm.FontProperties(fname=FONT_PATH)
+    fm.fontManager.addfont(FONT_PATH)
+    plt.rcParams['font.sans-serif'] = [my_font.get_name()]
+else:
+    # 若沒放字型檔，嘗試使用 Linux/Windows 系統備用字型
+    plt.rcParams['font.sans-serif'] = ['Noto Sans CJK TC', 'Microsoft JhengHei', 'DejaVu Sans']
+
+plt.rcParams['axes.unicode_minus'] = False  # 避免負號顯示異常
+
+
+# ==========================================
+# 1. 頁面基本配置
+# ==========================================
+st.set_page_config(
+    page_title="CorrDiff 降尺度實驗評估系統",
+    page_icon="🌧️",
+    layout="wide"
+)
+DB_PATH = "corrdiff_allmetrics.db"
+BASE_NC_DIR = "output"
+EXPERIMENT_NC_MAP = {
+    "P2P": os.path.join(BASE_NC_DIR, "P2P25Y/output_0_all.nc"),
+    "CP2P": os.path.join(BASE_NC_DIR, "CP2P25Y/output_0_all.nc")
+}
+
+# WRF 208x208 網格與地形座標檔
+GRID_COORDS_NC = "wrf_208x208_grid_coords.nc"
+
+
+# ==========================================
+# 2. CWB 標準雨量色階與 BoundaryNorm 定義
+# ==========================================
+PRECIP_BOUNDS = [0, 5, 10, 20, 30, 50, 60, 90, 130, 150, 200, 270, 300, 400, 500, 600, 700]
+PRECIP_COLORS = [
+    "#FFFFFF", "#A0F0FF", "#00A0FF", "#0060FF", "#0000FF", "#00A000", "#00E000", "#FFFF00", 
+    "#FFC000", "#FF8000", "#FF0000", "#D00000", "#960000", "#6E006E", "#B400D2", "#FF00FF", "#FFC0FF"
+]
+
+# 建立獨立的 Matplotlib Colormap & BoundaryNorm (精準對應 ncolors)
+cwb_cmap = LinearSegmentedColormap.from_list("cwb_precip_cmap", PRECIP_COLORS, N=len(PRECIP_COLORS))
+cwb_norm = BoundaryNorm(PRECIP_BOUNDS, ncolors=cwb_cmap.N, extend='max')
+
+
+# ==========================================
+# 3. 快取載入與資料庫讀取函式
+# ==========================================
+@st.cache_data
+def load_wrf_grid_coords(coords_path=GRID_COORDS_NC):
+    """載入專屬 WRF 網格座標 (XLAT, XLONG, LANDMASK, TER)"""
+    if not os.path.exists(coords_path):
+        return None, None, None, None
+    ds_coords = xr.open_dataset(coords_path)
+    lats = ds_coords['XLAT'].values
+    lons = ds_coords['XLONG'].values
+    land_mask = ds_coords['LANDMASK'].values
+    ter = ds_coords['TER'].values
+    ds_coords.close()
+    return lats, lons, land_mask, ter
+
+@st.cache_data
+def load_all_time_metrics(db_path=DB_PATH):
+    """載入所有實驗的全時間平均指標"""
+    if not os.path.exists(db_path):
+        return None
+    conn = sqlite3.connect(db_path)
+    query = """
+    SELECT exp_name, file_name, comparison_type, variable_name, 
+           rmse, fss_threshold, fss_window_size, fss_score
+    FROM experiment_metrics
+    WHERE comparison_type = 'pred_vs_truth'
+    """
+    try:
+        df = pd.read_sql_query(query, conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+@st.cache_data
+def get_grid_scatter_combos(db_path=DB_PATH):
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT DISTINCT exp_x, exp_y FROM grid_rmse_scatter")
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        conn.close()
+        return []
+
+def load_grid_scatter_data(exp_x, exp_y, var_name="precipitation", db_path=DB_PATH):
+    """從資料庫中讀取兩個實驗的格點對應散佈數據"""
+    if not os.path.exists(db_path):
+        return None, None, None
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT ratio_y_gt_x, x_values, y_values FROM grid_rmse_scatter WHERE exp_x=? AND exp_y=? AND var_name=?", (exp_x, exp_y, var_name))
+    row = cursor.fetchone()
+    
+    is_swapped = False
+    if not row:
+        cursor.execute("SELECT ratio_y_gt_x, x_values, y_values FROM grid_rmse_scatter WHERE exp_x=? AND exp_y=? AND var_name=?", (exp_y, exp_x, var_name))
+        row = cursor.fetchone()
+        is_swapped = True
+
+    conn.close()
+
+    if not row:
+        return None, None, None
+
+    ratio_orig = row[0]
+    x_draw = np.frombuffer(row[1], dtype=np.float32)
+    y_draw = np.frombuffer(row[2], dtype=np.float32)
+
+    if is_swapped:
+        x_draw, y_draw = y_draw, x_draw
+        ratio_y_gt_x = 100.0 - ratio_orig
+    else:
+        ratio_y_gt_x = ratio_orig
+
+    return ratio_y_gt_x, x_draw, y_draw
+
+@st.cache_data
+def get_nc_time_list(nc_path):
+    """解析相對時間天數並轉為 YYYY-MM-DD HH:MM"""
+    if not os.path.exists(nc_path):
+        return []
+    ds = xr.open_dataset(nc_path)
+    try:
+        if np.issubdtype(ds['time'].dtype, np.datetime64):
+            time_series = pd.to_datetime(ds['time'].values)
+        else:
+            base_date = pd.Timestamp("2023-01-01 00:00:00")
+            time_series = [base_date + pd.Timedelta(days=float(t)) for t in ds['time'].values]
+        times = [t.strftime('%Y-%m-%d %H:%M') for t in time_series]
+    except Exception:
+        times = [f"Step {idx}" for idx in range(len(ds['time'].values))]
+    ds.close()
+    return times
+
+@st.cache_data
+def load_spatial_slice(nc_path, time_idx, var_name):
+    """讀取 Truth, Prediction (Ensemble平均), Input 的 2D 矩陣"""
+    ds_truth = xr.open_dataset(nc_path, group="truth")
+    ds_pred = xr.open_dataset(nc_path, group="prediction")
+    ds_input = xr.open_dataset(nc_path, group="input")
+
+    truth_2d = ds_truth[var_name].isel(time=time_idx).values
+    input_2d = ds_input[var_name].isel(time=time_idx).values
+
+    pred_var = ds_pred[var_name].isel(time=time_idx)
+    if "ensemble" in pred_var.dims:
+        pred_2d = pred_var.mean(dim="ensemble").values
+    else:
+        pred_2d = pred_var.values
+
+    ds_truth.close(); ds_pred.close(); ds_input.close()
+    return truth_2d, pred_2d, input_2d
+
+
+# ==========================================
+# 4. 側邊欄選單
+# ==========================================
+st.sidebar.title("🌧️ CorrDiff 評估儀表板")
+tab_selection = st.sidebar.radio(
+    "請選擇分析模式：",
+    ["📊 全時間平均指標 (RMSE & FSS)", "🗺️ 跨實驗格點 RMSE 散佈圖", "🌍 空間場數據繪圖 (Spatial Plot)"]
+)
+st.sidebar.markdown("---")
+
+
+# ==========================================
+# TAB 1: 全時間平均指標分析 (RMSE & FSS)
+# ==========================================
+if tab_selection == "📊 全時間平均指標 (RMSE & FSS)":
+    st.title("📊 各實驗全時間平均指標 (Prediction vs. Truth)")
+    
+    df_metrics = load_all_time_metrics(DB_PATH)
+    if df_metrics is None or df_metrics.empty:
+        st.error(f"❌ 找不到資料庫檔案 `{DB_PATH}` 或無資料，請先執行預處理腳本。")
+        st.stop()
+
+    all_exps = sorted(df_metrics['exp_name'].unique().tolist())
+    selected_exps = st.sidebar.multiselect("選擇要比較的實驗：", options=all_exps, default=all_exps)
+
+    if not selected_exps:
+        st.info("請至少選擇一個實驗。")
+        st.stop()
+
+    df_filtered = df_metrics[df_metrics['exp_name'].isin(selected_exps)]
+
+    # 1. 總平均 RMSE
+    st.subheader("1. 跨實驗總平均 RMSE 對比 (越低越好)")
+    df_rmse_avg = df_filtered.groupby('exp_name', as_index=False)['rmse'].mean().sort_values('rmse')
+    cols = st.columns(len(df_rmse_avg))
+    best_rmse = df_rmse_avg['rmse'].min()
+
+    for idx, row in df_rmse_avg.reset_index(drop=True).iterrows():
+        with cols[idx]:
+            if row['rmse'] == best_rmse:
+                st.metric(f"🏆 {row['exp_name']} (最佳)", f"{row['rmse']:.4f} mm/hr")
+            else:
+                st.metric(row['exp_name'], f"{row['rmse']:.4f} mm/hr", delta=f"+{row['rmse'] - best_rmse:.4f}", delta_color="inverse")
+
+    st.markdown("---")
+
+    # 2. FSS 分數圖表與熱力圖
+    st.subheader("2. Fractional Skill Score (FSS) 平均表現 (越高越好)")
+    fss_tab1, fss_tab2, fss_tab3 = st.tabs(["🎯 特定門檻/視窗", "📈 FSS 隨門檻變化曲線", "🔥 FSS 矩陣熱力圖"])
+
+    with fss_tab1:
+        c1, c2 = st.columns(2)
+        with c1: selected_th = st.selectbox("選擇降雨門檻 (mm/hr):", sorted(df_filtered['fss_threshold'].unique()), index=2)
+        with c2: selected_w = st.selectbox("選擇視窗大小:", sorted(df_filtered['fss_window_size'].unique()), index=2)
+
+        df_fss_sub = df_filtered[(df_filtered['fss_threshold'] == selected_th) & (df_filtered['fss_window_size'] == selected_w)].groupby('exp_name', as_index=False)['fss_score'].mean()
+        fig_fss_bar = px.bar(df_fss_sub, x='exp_name', y='fss_score', color='exp_name', text_auto='.3f')
+        fig_fss_bar.update_layout(showlegend=False, yaxis_range=[0, 1.1])
+        st.plotly_chart(fig_fss_bar, width="stretch")
+
+    with fss_tab2:
+        selected_w_tab2 = st.selectbox("選擇空間視窗大小:", sorted(df_filtered['fss_window_size'].unique()), index=2, key="w_tab2")
+        df_fss_line = df_filtered[df_filtered['fss_window_size'] == selected_w_tab2].groupby(['exp_name', 'fss_threshold'], as_index=False)['fss_score'].mean()
+        
+        fig_fss_line = px.line(df_fss_line, x='fss_threshold', y='fss_score', color='exp_name', markers=True,
+                               labels={'fss_threshold': '降雨門檻 Threshold (mm/hr)', 'fss_score': '平均 FSS 分數'})
+        fig_fss_line.update_layout(yaxis_range=[0, 1.05])
+        fig_fss_line.update_xaxes(type='category')
+        st.plotly_chart(fig_fss_line, width="stretch")
+
+    with fss_tab3:
+        exp_for_hm = st.selectbox("選擇實驗：", selected_exps, key="hm_exp")
+        df_hm = df_filtered[df_filtered['exp_name'] == exp_for_hm].groupby(['fss_threshold', 'fss_window_size'], as_index=False)['fss_score'].mean()
+        pivot_fss = df_hm.pivot(index='fss_window_size', columns='fss_threshold', values='fss_score')
+        
+        fig_hm = px.imshow(pivot_fss, text_auto='.3f', color_continuous_scale='Viridis', zmin=0, zmax=1)
+        fig_hm.update_yaxes(autorange="reversed")
+        st.plotly_chart(fig_hm, width="stretch")
+
+
+# ==========================================
+# TAB 2: 跨實驗格點 RMSE 散佈圖比較
+# ==========================================
+elif tab_selection == "🗺️ 跨實驗格點 RMSE 散佈圖":
+    st.title("🗺️ 跨實驗格點 RMSE 比較 (Grid-level Scatter)")
+    
+    combos = get_grid_scatter_combos(DB_PATH)
+    if not combos:
+        st.error("❌ 資料庫中找不到預算好的格點 RMSE 數據。")
+        st.stop()
+
+    all_grid_exps = sorted(list(set([r[0] for r in combos] + [r[1] for r in combos])))
+
+    col_x, col_y = st.columns(2)
+    with col_x: exp_x = st.selectbox("選擇 X 軸實驗 (Baseline)", all_grid_exps, index=0)
+    with col_y: exp_y = st.selectbox("選擇 Y 軸實驗 (Comparison)", all_grid_exps, index=1 if len(all_grid_exps)>1 else 0)
+
+    if exp_x == exp_y:
+        st.warning("⚠️ 請選擇不同的實驗進行比較。")
+    else:
+        # 1. 讀取 RMSE 數值
+        ratio_y_gt_x, x_draw, y_draw = load_grid_scatter_data(exp_x, exp_y, var_name="precipitation", db_path=DB_PATH)
+
+        # 2. 透過 NC 檔讀取時間列表
+        nc_path_x = EXPERIMENT_NC_MAP.get(exp_x)
+        if nc_path_x and os.path.exists(nc_path_x):
+            times = get_nc_time_list(nc_path_x)
+        else:
+            times = []
+        
+        if x_draw is not None:
+            # ===== 自動匹配時間陣列與散佈圖點數 =====
+            if len(times) == len(x_draw):
+                # 情況 A：每個點代表單一時間步的數值
+                date_info = times
+            elif len(times) > 0 and len(x_draw) % len(times) == 0:
+                # 情況 B：時間 x 空間格點 全攤平
+                num_grids = len(x_draw) // len(times)
+                date_info = np.repeat(times, num_grids)
+            else:
+                # 情況 C：全時間平均的純地理格點圖 (自動抓取涵蓋的年份)
+                if len(times) > 0:
+                    try:
+                        start_year = str(times[0])[:4]
+                        start_date = str(times[0])[:10]
+                        end_year = str(times[-1])[:4]
+                        if start_year.isdigit() and end_year.isdigit():
+                            if start_year == end_year:
+                                year_str = f"{start_year}年平均"
+                            else:
+                                year_str = f"{start_date}"
+                        else:
+                            year_str = "全時間平均(無單一日)"
+                    except Exception:
+                        year_str = "全時間平均(無單一日)"
+                else:
+                    year_str = "全時間平均"
+                
+                date_info = [year_str] * len(x_draw)
+            # ========================================
+
+            # 建立 Dataframe 供 Plotly 使用
+            df_scatter = pd.DataFrame({
+                'x_rmse': x_draw,
+                'y_rmse': y_draw,
+                'date_info': date_info
+            })
+
+            fig_scatter = px.scatter(
+                df_scatter, x='x_rmse', y='y_rmse', 
+                custom_data=['date_info'],  # ✅ 將動態算出的日期/年份傳入 customdata
+                opacity=0.35,
+                labels={'x_rmse': f"{exp_x} (mm/hr)", 'y_rmse': f"{exp_y} (mm/hr)"},
+                title=f"【Pred vs. Truth 格點 RMSE 對比】{exp_x} vs. {exp_y}"
+            )
+
+            # ✅ 設定 Hover 懸浮視窗格式，加入日期/年份資訊
+            fig_scatter.update_traces(
+                hovertemplate=(
+                    "<b>日期/時間:</b> %{customdata[0]}<br>"
+                    f"<b>{exp_x} RMSE:</b> %{{x:.4f}} mm/hr<br>"
+                    f"<b>{exp_y} RMSE:</b> %{{y:.4f}} mm/hr"
+                    "<extra></extra>"
+                )
+            )
+
+            max_val = max(float(x_draw.max()), float(y_draw.max())) * 1.05
+            fig_scatter.add_shape(type="line", x0=0, y0=0, x1=max_val, y1=max_val, line=dict(color="Red", dash="dash"))
+            fig_scatter.update_xaxes(range=[0, max_val])
+            fig_scatter.update_yaxes(range=[0, max_val])
+            
+            anno_text = f"<b>Y > X 比例: {ratio_y_gt_x:.1f}%</b><br>X > Y 比例: {100-ratio_y_gt_x:.1f}%"
+            fig_scatter.add_annotation(
+                xref="paper", yref="paper", x=0.03, y=0.95, text=anno_text,
+                showarrow=False, align="left", bgcolor="rgba(255, 255, 255, 0.85)", bordercolor="gray", borderwidth=1
+            )
+            st.plotly_chart(fig_scatter, width="stretch")
+
+
+# ==========================================
+# TAB 3: 空間場數據繪圖 (Spatial Plot)
+# ==========================================
+elif tab_selection == "🌍 空間場數據繪圖 (Spatial Plot)":
+    st.title("🌍 空間場數據繪圖 (Target / Input / Prediction 對比)")
+
+    lats, lons, land_mask, ter = load_wrf_grid_coords(GRID_COORDS_NC)
+    if lats is None:
+        st.error(f"❌ 找不到座標檔案 `{GRID_COORDS_NC}`，請確認檔案位置。")
+        st.stop()
+
+    exp_list = list(EXPERIMENT_NC_MAP.keys())
+    selected_exp = st.sidebar.selectbox("選擇實驗組別：", options=exp_list, index=0)
+    nc_path = EXPERIMENT_NC_MAP[selected_exp]
+
+    if not os.path.exists(nc_path):
+        st.error(f"❌ 找不到檔案：`{nc_path}`\n請檢查相對路徑！")
+        st.stop()
+
+    times = get_nc_time_list(nc_path)
+    
+    col_var, col_time = st.columns([1, 2])
+    with col_var:
+        var_opts = {"降雨量 (precipitation)": "precipitation", "2米氣溫": "temperature_2m"}
+        var_name = var_opts[st.selectbox("選擇變數：", list(var_opts.keys()))]
+    with col_time:
+        selected_time_str = st.selectbox("選擇日期/時間：", times, index=0)
+        time_idx = times.index(selected_time_str)
+
+    truth_2d, pred_2d, input_2d = load_spatial_slice(nc_path, time_idx, var_name)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6.5))
+    fig.suptitle(f"{var_name} - {selected_time_str} ({selected_exp})", fontsize=18, y=0.96)
+    
+    lon_min, lon_max = lons.min(), lons.max()
+    lat_min, lat_max = lats.min(), lats.max()
+    extent = [lon_min, lon_max, lat_min, lat_max]
+
+    for idx, ax in enumerate(axes):
+        data = [truth_2d, input_2d, pred_2d][idx]
+        title = ["Target (TReAD)", "Input (ERA5)", "CorrDiff (Reg)"][idx]
+        
+        im = ax.imshow(
+            data, extent=extent, origin='lower', aspect='equal',
+            cmap=cwb_cmap if var_name == "precipitation" else 'turbo',
+            norm=cwb_norm if var_name == "precipitation" else None
+        )
+        
+        if land_mask is not None:
+            ax.contour(lons, lats, land_mask, levels=[0.5], colors='black', linewidths=1.0)
+        
+        ax.set_title(title, fontsize=14, pad=10)
+        ax.set_xlabel("經度 (Longitude)")
+        if idx == 0: ax.set_ylabel("緯度 (Latitude)")
+
+    fig.subplots_adjust(right=0.84, wspace=0.2)
+    cbar = fig.colorbar(
+        im, cax=fig.add_axes([0.86, 0.18, 0.02, 0.65]), 
+        extend='max' if var_name == "precipitation" else 'neither'
+    )
+    if var_name == "precipitation":
+        cbar.set_ticks(PRECIP_BOUNDS)
+        cbar.set_label('降雨量 (mm/hr)', fontsize=12)
+
+    st.pyplot(fig)
+

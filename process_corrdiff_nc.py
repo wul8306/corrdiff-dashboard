@@ -136,7 +136,34 @@ def batch_save_to_db(results, db_path="corrdiff_metrics.db"):
     conn.close()
 
 if __name__ == "__main__":
-    init_db("corrdiff_metrics.db")
-    # 執行單一檔案範例
-    records = process_grouped_nc("/syn_sata8/users/lct/corrdiff/plot/out2/SF2SF/netcdf/output_0_all.nc", exp_name="Exp_v1")
+# 執行單一檔案範例
+#    records = process_grouped_nc("../plot/out2/SF2SF/netcdf/output_0_all.nc", exp_name="Exp_v1")
+    db_file = "corrdiff_metrics.db"
+    init_db(db_file)
+
+    # 1. 定義實驗清單與目標檔案路徑
+    base_dir = "../plot/out2"
+    
+    experiments = {
+        "SF2SF": os.path.join(base_dir, "SF2SF/netcdf/*.nc"),
+        "SF2SFslp":  os.path.join(base_dir, "SF2SFslp/netcdf/*.nc"),
+        "P2P":   os.path.join(base_dir, "P2P25Y/netcdf/*.nc")
+    }
+
+    # 2. 迴圈處理每一個實驗
+    for exp_name, path_pattern in experiments.items():
+        nc_files = glob.glob(path_pattern)
+        print(f"\n[INFO] 開始處理實驗：{exp_name}，共找到 {len(nc_files)} 個檔案")
+
+        for nc_file in sorted(nc_files):
+            print(f"  └─ 處理檔案: {os.path.basename(nc_file)}")
+            records = process_grouped_nc(nc_file, exp_name=exp_name, var_name="precipitation")
+            
+            # 批次寫入資料庫
+            if records:
+                batch_save_to_db(records, db_path=db_file)
+                print(f"     已寫入 {len(records)} 筆指標數據")
+
+    print("\n[SUCCESS] 所有實驗計算完成！")
+
     batch_save_to_db(records)

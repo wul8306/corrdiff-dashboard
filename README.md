@@ -21,7 +21,7 @@
 ```text
 corrdiff-dashboard/
 ├── process_corrdiff_nc.py  # 核心腳本：讀取 NetCDF 群組，預計算 RMSE/FSS 並寫入 SQLite
-├── app.py                  # 前端網頁：Streamlit 互動 Dashboard
+├── app.py                  # 前端網頁：Streamlit 互動 Dashboard (streamlit run app.py)
 ├── corrdiff_metrics.db     # 預計算指標資料庫 (可上傳至 GitHub 作為 Demo)
 ├── requirements.txt        # 套件依賴清單
 ├── .gitignore              # 忽略原始大型 .nc 檔案

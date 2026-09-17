@@ -6,3 +6,7 @@ plotly
 scipy
 numpy
 pandas
+matplotlib
+pandas
+cartopy
+geocat.viz
