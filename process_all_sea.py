@@ -4,8 +4,20 @@ import sqlite3
 import numpy as np
 import pandas as pd
 import xarray as xr
+import yaml
 from scipy.ndimage import uniform_filter
 
+# ==============================================================================
+#   載入 YAML 設定檔 for experiments
+# ==============================================================================
+def load_config(config_path: str = "config.yaml") -> dict:
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"❌ 找不到設定檔: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    return config
 
 # ==============================================================================
 # 一、核心計算模組 (Core Computation Module)
@@ -334,10 +346,40 @@ def run_precomputations(exp_nc_map: dict[str, str], db_path: str = "corrdiff_all
 # ==============================================================================
 
 if __name__ == "__main__":
-    EXPERIMENT_NC_MAP = {
-        "P2P": "output/P2P25Y/output_0_all.nc",
-        "CP2P": "output/CP2P25Y/output_0_all.nc",
-    }
+#    EXPERIMENT_NC_MAP = {
+#        "P2P": "output/P2P25Y/output_0_all.nc",
+#        "CP2P": "output/CP2P25Y/output_0_all.nc",
+#        "SFCP2P": "output/SFCP2P/output_0_all.nc",
+#        "SFCP2SF": "output/SFCP2SF/output_0_all.nc",
+#        "3DCP2P": "output/3DCP2P/output_0_all.nc",
+#        "3DNOP2P": "output/3DNOP2P/output_0_all.nc",
+#        "3DNOP8502P": "output/3DNOP8502P/output_0_all.nc",
+#        "3DCP2SF": "output/3DCP2SF/output_0_all.nc",
+#        "3DCP8502SF": "output/3DCP8502SF/output_0_all.nc",
+#    }
+#   DB_FILE = "corrdiff_allmetrics_sea.db"
+#   run_precomputations(EXPERIMENT_NC_MAP, db_path=DB_FILE, var_name="precipitation")
 
-    DB_FILE = "corrdiff_allmetrics_sea.db"
-    run_precomputations(EXPERIMENT_NC_MAP, db_path=DB_FILE, var_name="precipitation")
+    CONFIG_PATH = "config.yaml"
+    config = load_config(CONFIG_PATH)
+
+    # 2. 提取實驗映射圖與相關設定
+    EXPERIMENT_NC_MAP = config["experiments"]
+    VAR_NAME = config["dataset"]["variable_name"]
+    DB_PATH = config["dataset"]["db_path"]
+
+    MASK_PATH = config["dataset"]["mask"]["path"]
+    MASK_VAR = config["dataset"]["mask"]["variable_name"]
+    MASK_VAL = config["dataset"]["mask"]["target_value"]
+
+    print(f"✅ 成功載入 {len(EXPERIMENT_NC_MAP)} 個實驗設定：")
+    for exp_name, nc_path in EXPERIMENT_NC_MAP.items():
+        print(f"  • {exp_name} -> {nc_path}")
+
+    print(f"\n ✅ 輸出db設定:  {DB_PATH}")
+    # 3. 執行預計算與資料庫寫入
+    run_precomputations(
+        exp_nc_map=EXPERIMENT_NC_MAP,
+        db_path=DB_PATH,
+        var_name=VAR_NAME
+    )

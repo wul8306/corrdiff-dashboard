@@ -14,6 +14,30 @@ import streamlit as st
 import xarray as xr
 from matplotlib.colors import BoundaryNorm, ListedColormap  # 修正：匯入 ListedColormap
 import math
+import io
+import yaml
+
+# ==============================================================================
+#   載入 YAML 設定檔 for experiments
+# ==============================================================================
+def load_config(config_path: str = "config.yaml") -> dict:
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"❌ 找不到設定檔: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    return config
+
+# ==============================================
+# 將 Matplotlib Figure 物件轉為 PNG Byte 流供下載
+# ===============================================
+def fig_to_bytes(fig, dpi=300):
+    buf = io.BytesIO()
+    # bbox_inches='tight' 可確保圖例與標題不被切掉
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=dpi)
+    buf.seek(0)
+    return buf
 
 # ==========================================
 # 0. 設定 Matplotlib 中文字型
@@ -53,15 +77,14 @@ st.markdown(
 )
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(CURRENT_DIR, "corrdiff_allmetrics_sea.db")
-BASE_NC_DIR = "output"
-EXPERIMENT_NC_MAP = {
-    "P2P": os.path.join(BASE_NC_DIR, "P2P25Y/output_0_all.nc"),
-    "CP2P": os.path.join(BASE_NC_DIR, "CP2P25Y/output_0_all.nc"),
-    "SFCP2P": os.path.join(BASE_NC_DIR, "SFCP2P/output_0_all.nc"),
-    "SFCP2SF": os.path.join(BASE_NC_DIR, "SFCP2SF/output_0_all.nc"),
-    "3DCP2SF": os.path.join(BASE_NC_DIR, "3DCP2SF/output_0_all.nc"),
-}
+#DB_PATH = os.path.join(CURRENT_DIR, "corrdiff_allmetrics_sea.db")
+DB_PATH = os.path.join(CURRENT_DIR, "corrdiff_allmetrics_sea_land.db")
+CONFIG_PATH = "config.yaml"
+config = load_config(CONFIG_PATH)
+EXPERIMENT_NC_MAP = config["experiments"]
+for exp_name, nc_path in EXPERIMENT_NC_MAP.items():
+    print(f"  • {exp_name} -> {nc_path}")
+
 GRID_COORDS_NC = "wrf_208x208_grid_coords.nc"
 
 
@@ -69,6 +92,7 @@ GRID_COORDS_NC = "wrf_208x208_grid_coords.nc"
 # 2. CWB 標準雨量色階定義 (修正為 ListedColormap)
 # ==========================================
 PRECIP_BOUNDS = [0, 5, 10, 20, 30, 50, 60, 90, 130, 150, 200, 270, 300, 400, 500, 600, 700]
+PRECIP_BOUNDS_meiyu = [0, 1, 2, 6, 10, 15, 20, 30, 40, 50, 70, 90, 110, 130, 150, 200, 300]
 PRECIP_COLORS = [
     "#FFFFFF", "#A0F0FF", "#00A0FF", "#0060FF", "#0000FF", "#00A000", "#00E000", "#FFFF00",
     "#FFC000", "#FF8000", "#FF0000", "#D00000", "#960000", "#6E006E", "#B400D2", "#FF00FF", "#FFC0FF"
@@ -77,7 +101,7 @@ PRECIP_COLORS = [
 # 正確做法：採用 ListedColormap 將顏色直接與 BoundaryNorm 區間一對一綁定
 cwb_cmap = ListedColormap(PRECIP_COLORS)
 cwb_norm = BoundaryNorm(PRECIP_BOUNDS, ncolors=cwb_cmap.N, extend="max")
-
+cwb_norm_meiyu = BoundaryNorm(PRECIP_BOUNDS_meiyu, ncolors=cwb_cmap.N, extend="max")
 
 # ==========================================
 # 3. 快取載入與資料庫讀取函式
@@ -228,7 +252,37 @@ def get_nc_time_list(nc_path):
 
 
 @st.cache_data
-def load_spatial_slice(nc_path, time_idx, var_name):
+def load_spatial_slice(nc_path: str, time_idx: int, var_name: str, only_pred: bool = False):
+    try:
+        # 1. 讀取 Prediction Group (所有實驗都需要)
+        with xr.open_dataset(nc_path, group="prediction") as ds_pred:
+            da_pred = ds_pred[var_name]
+            if "ensemble" in da_pred.dims:
+                da_pred = da_pred.mean(dim="ensemble")
+            p_2d = da_pred.isel(time=time_idx).values
+
+        # 🔹 如果只需要 prediction，直接在此 return，不用花時間開 truth 與 input group
+        if only_pred:
+            return None, p_2d, None
+
+        # 2. 讀取 Truth Group (僅第一筆實驗需要)
+        with xr.open_dataset(nc_path, group="truth") as ds_truth:
+            t_2d = ds_truth[var_name].isel(time=time_idx).values
+
+        # 3. 讀取 Input Group (僅第一筆實驗需要，若無 input group 則給 None)
+        try:
+            with xr.open_dataset(nc_path, group="input") as ds_input:
+                i_2d = ds_input[var_name].isel(time=time_idx).values
+        except Exception:
+            i_2d = None
+
+        return t_2d, p_2d, i_2d
+
+    except Exception:
+        return None, None, None
+
+@st.cache_data
+def load_spatial_slice_old(nc_path, time_idx, var_name):
     with (
         xr.open_dataset(nc_path, group="truth") as ds_truth,
         xr.open_dataset(nc_path, group="prediction") as ds_pred,
@@ -295,13 +349,25 @@ def render_scatter_plot(table_name, mode_name):
         )
         fig_scatter.update_xaxes(range=[0, max_val])
         fig_scatter.update_yaxes(range=[0, max_val])
+#        fig_scatter.update_xaxes(range=[0, max_val], showline=True, linecolor="black",tickfont=dict(color="black", size=12),title_font=dict(color="black", size=14))
+#        fig_scatter.update_yaxes(range=[0, max_val], showline=True, linecolor="black",tickfont=dict(color="black", size=12),title_font=dict(color="black", size=14),)
 
         anno_text = f"<b>Y > X 比例: {ratio_y_gt_x:.1f}%</b><br>X > Y 比例: {100-ratio_y_gt_x:.1f}%"
         fig_scatter.add_annotation(
             xref="paper", yref="paper", x=0.03, y=0.95, text=anno_text, showarrow=False, align="left",
             bgcolor="rgba(255, 255, 255, 0.85)", bordercolor="gray", borderwidth=1
         )
-        st.plotly_chart(fig_scatter)
+        config = {
+            "toImageButtonOptions": {
+            "format": "png",  # 可選 'png', 'svg', 'jpeg', 'webp'
+            "filename": f"{table_name}_{exp_x}_{exp_y}",  # 👈 在這裡設定自訂檔名 (不需要寫副檔名)
+            "height": 500,
+            "width": 800,
+            "scale": 1.5,  # 放大倍率，2 代表 2 倍高解析度
+            }   
+        }
+#       st.plotly_chart(fig_scatter)
+        st.plotly_chart(fig_scatter,config=config)
     else:
         st.warning("⚠️ 該組實驗對比無有效散佈資料。")
 
@@ -417,7 +483,8 @@ def plot_multi_exp_spatial_maps(
     if var_name == "precipitation" or var_name == "Precipitation":
         if levels is None:
             levels = PRECIP_BOUNDS
-        norm = cwb_norm
+        if norm is None:
+            norm = cwb_norm
     elif levels is None:
         levels = np.linspace(0, 100, 11)
 
@@ -501,6 +568,7 @@ tab_selection = st.sidebar.radio(
         "🗺️ 跨實驗 RMSE 散佈圖比較",
         "🌍 空間場數據繪圖 (Spatial Plot)",
         "🌀 颱風日空間場繪圖 (Typhoon Plot)",
+        "🌧️ 梅雨季極端雨量分析 (Meiyu Plot)",
     ],
 )
 st.sidebar.markdown("---")
@@ -622,9 +690,20 @@ elif tab_selection == "📅 季節性 RMSE 比較 (Seasonal)":
         labels={"season": "季節 (Season)", "rmse_mean": "平均 RMSE (mm/hr)", "exp_name": "實驗名稱"},
         title="各實驗在不同季節的降雨 RMSE 表現 (數值越低越好)",
     )
+    # 2. 設定右上角下載按鈕的參數
+    config = {
+        "toImageButtonOptions": {
+            "format": "png",  # 可選 'png', 'svg', 'jpeg', 'webp'
+            "filename": f"rmse_seabar",  # 👈 在這裡設定自訂檔名 (不需要寫副檔名)
+            "height": 500,
+            "width": 800,
+            "scale": 2,  # 放大倍率，2 代表 2 倍高解析度
+        }
+    }   
     fig_season.update_traces(textposition="outside")
     fig_season.update_layout(yaxis_range=[0, df_filtered_season["rmse_mean"].max() * 1.25])
-    st.plotly_chart(fig_season)
+#   st.plotly_chart(fig_season)
+    st.plotly_chart(fig_season, config=config)
 
 elif tab_selection == "🗺️ 跨實驗 RMSE 散佈圖比較":
     st.title("🗺️ 跨實驗 RMSE 散佈圖比較 (Scatter Plot)")
@@ -658,7 +737,7 @@ elif tab_selection == "🌍 空間場數據繪圖 (Spatial Plot)":
         selected_time_str = st.selectbox("選擇日期/時間：", times, index=0)
         time_idx = times.index(selected_time_str)
 
-    truth_2d, pred_2d, input_2d = load_spatial_slice(nc_path, time_idx, var_name)
+    truth_2d, pred_2d, input_2d = load_spatial_slice_old(nc_path, time_idx, var_name)
     plot_spatial_maps(
         var_name, selected_time_str, selected_exp, lats, lons, land_mask, truth_2d, input_2d, pred_2d, is_typhoon=False
     )
@@ -704,9 +783,13 @@ elif tab_selection == "🌀 颱風日空間場繪圖 (Typhoon Plot)":
     for exp_k, path_v in EXPERIMENT_NC_MAP.items():
         if os.path.exists(path_v):
             try:
-                t_2d, p_2d, i_2d = load_spatial_slice(path_v, time_idx, var_name)
                 if truth_2d is None:
-                    truth_2d, input_2d = t_2d, i_2d
+                    # 1. 第一筆成功讀取的實驗：同步保留 truth_2d 與 input_2d
+                    truth_2d, p_2d, input_2d = load_spatial_slice(path_v, time_idx, var_name, only_pred=False)
+                else:
+                    # 2. 後續實驗：僅保留 p_2d，忽略 truth 與 input (以 _ 接收)
+                    _, p_2d, _ = load_spatial_slice(path_v, time_idx, var_name, only_pred=True)
+
                 exp_preds_dict[exp_k] = p_2d
             except Exception:
                 missing_exps.append(exp_k)
@@ -720,7 +803,7 @@ elif tab_selection == "🌀 颱風日空間場繪圖 (Typhoon Plot)":
         st.error("❌ 無法載入任何實驗的繪圖數據。")
         st.stop()
 
-    all_maps_dict = {"Target": truth_2d, "Input": input_2d, **exp_preds_dict}
+    all_maps_dict = {"Target(TReAD)": truth_2d, "Input(ERA5)": input_2d, **exp_preds_dict}
     fig, axes = plot_multi_exp_spatial_maps(
         exp_data_dict=all_maps_dict,
         lons=lons,
@@ -729,5 +812,114 @@ elif tab_selection == "🌀 颱風日空間場繪圖 (Typhoon Plot)":
         time_str=selected_time_str,
         land_mask=land_mask,
     )
+    # 2. 將圖像轉為 Byte 資料
+    img_bytes = fig_to_bytes(fig, dpi=300)
+
+    # 3. 使用 columns 控制右上角下載按鈕版面
+    col_left, col_btn = st.columns([0.75, 0.25])
+
+    with col_btn:
+    # 放置於右上角的下載按鈕
+        st.download_button(
+            label="📥 下載空間雨量圖 (PNG)",
+            data=img_bytes,
+            file_name=f"typhoon_spatial_map_{var_name}_{selected_ty_date}.png",
+            mime="image/png",
+            use_container_width=True,  # 讓按鈕自動填滿欄位寬度
+            key=f"dl_tab5",  # 加上獨特 key 避免跨 Tab 衝突
+        )
+    st.pyplot(fig)
+    plt.close(fig)
+
+elif tab_selection == "🌧️ 梅雨季極端雨量分析 (Meiyu Plot)":
+    st.title("🌧️梅雨季極端雨量跨實驗空間場對比 (Target / Input / All Experiments)")
+    lats, lons, land_mask, ter = load_wrf_grid_coords(GRID_COORDS_NC)
+    if lats is None:
+        st.error(f"❌ 找不到座標檔案 `{GRID_COORDS_NC}`，請確認檔案位置。")
+        st.stop()
+
+    TY_FILE = "2016_2023_MJ_extremed.txt"
+    ty_dates = load_typhoon_dates(TY_FILE)
+    if not ty_dates:
+        st.error(f"❌ 找不到檔案 `{TY_FILE}` 或檔案無效。")
+        st.stop()
+
+    ref_nc_path = next((p for p in EXPERIMENT_NC_MAP.values() if os.path.exists(p)), None)
+    if not ref_nc_path:
+        st.error("❌ 在 `EXPERIMENT_NC_MAP` 中找不到任何有效的 NC 檔案。")
+        st.stop()
+
+    all_times = get_nc_time_list(ref_nc_path)
+    col_var, col_date, col_time = st.columns([1, 2, 1])
+    with col_var:
+        var_opts = {"降雨量 (precipitation)": "precipitation", "2米氣溫": "temperature_2m"}
+        var_name = var_opts[st.selectbox("選擇變數：", list(var_opts.keys()), key="ty_var")]
+    with col_date:
+        selected_ty_date = st.selectbox("選擇日期 (YYYY-MM-DD)：", ty_dates, index=0)
+
+    available_times = [t for t in all_times if t.startswith(selected_ty_date)]
+    if not available_times:
+        st.warning(f"⚠️ 找不到日期 `{selected_ty_date}` 的有效時間紀錄。")
+        st.stop()
+
+    with col_time:
+        selected_time_str = st.selectbox("選擇時間點：", available_times, index=0, key="ty_time")
+        time_idx = all_times.index(selected_time_str)
+
+    truth_2d, input_2d = None, None
+    exp_preds_dict, missing_exps = {}, []
+
+    for exp_k, path_v in EXPERIMENT_NC_MAP.items():
+        if os.path.exists(path_v):
+            try:
+                if truth_2d is None:
+                    # 1. 第一筆成功讀取的實驗：同步保留 truth_2d 與 input_2d
+                    truth_2d, p_2d, input_2d = load_spatial_slice(path_v, time_idx, var_name, only_pred=False)
+                else:
+                    # 2. 後續實驗：僅保留 p_2d，忽略 truth 與 input (以 _ 接收)
+                    _, p_2d, _ = load_spatial_slice(path_v, time_idx, var_name, only_pred=True)
+
+                exp_preds_dict[exp_k] = p_2d
+            except Exception:
+                missing_exps.append(exp_k)
+        else:
+            missing_exps.append(exp_k)
+
+    if missing_exps:
+        st.info(f"ℹ️ 提示：未找到以下實驗檔，將跳過繪製：{', '.join(missing_exps)}")
+
+    if not exp_preds_dict or truth_2d is None:
+        st.error("❌ 無法載入任何實驗的繪圖數據。")
+        st.stop()
+
+    all_maps_dict = {"Target(TReAD)": truth_2d, "Input(ERA5)": input_2d, **exp_preds_dict}
+    fig, axes = plot_multi_exp_spatial_maps(
+        exp_data_dict=all_maps_dict,
+        lons=lons,
+        lats=lats,
+        levels=PRECIP_BOUNDS_meiyu,
+        norm=cwb_norm_meiyu,
+        var_name=var_name,
+        time_str=selected_time_str,
+        land_mask=land_mask,
+    )
+
+    # 2. 將圖像轉為 Byte 資料
+    img_bytes = fig_to_bytes(fig, dpi=300)
+
+    # 3. 使用 columns 控制右上角下載按鈕版面
+    col_left, col_btn = st.columns([0.75, 0.25])
+
+    with col_btn:
+    # 放置於右上角的下載按鈕
+        st.download_button(
+            label="📥 下載空間雨量圖 (PNG)",
+            data=img_bytes,
+            file_name=f"meiyu_spatial_map_{var_name}_{selected_ty_date}.png",
+            mime="image/png",
+            use_container_width=True,  # 讓按鈕自動填滿欄位寬度
+            key=f"dl_tab6",  # 加上獨特 key 避免跨 Tab 衝突
+        )
+
     st.pyplot(fig)
     plt.close(fig)
