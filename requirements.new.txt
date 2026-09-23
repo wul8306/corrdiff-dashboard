@@ -9,3 +9,6 @@ pandas
 matplotlib
 pandas
 cartopy
+geocat.viz
+yaml
+json
