@@ -6,7 +6,7 @@ import streamlit as st
 st.set_page_config(layout="wide", page_title="CorrDiff 實驗評估 Dashboard")
 st.title("🌧️ CorrDiff 降雨降尺度實驗評估 Dashboard")
 
-DB_PATH = "corrdiff_allmetrics.db"
+DB_PATH = "corrdiff_metrics.db"
 
 # 使用快取載入 SQLite 資料
 @st.cache_data

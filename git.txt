@@ -1,0 +1,23 @@
+
+強制退回到遠端 HEAD 狀態（保留本地所有程式碼變更）
+git reset origin/main
+說明：這會撤銷所有本地尚未推送成功的 Commit，但完全不會刪除你的程式碼與檔案。
+
+確認大型檔案已被 .gitignore 排除
+請執行：
+git status
+
+觀察清單，確保 output/ 資料夾、.db 與 .nc 檔案「沒有」出現在清單中。若仍有出現，請確認專案根目錄的 .gitignore 檔案內容是否包含：
+
+Plaintext
+*.db
+*.nc
+*.ttf
+output/
+
+重新暫存並提交純程式碼與文字檔
+git add *.py README.md .gitignore *.txt
+git commit -m "Clean up history and update code"
+
+重新推送到 GitHub
+git push origin main
